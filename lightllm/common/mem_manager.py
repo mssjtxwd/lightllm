@@ -1,5 +1,6 @@
 import re
 import os
+from typing import Tuple
 import torch
 from lightllm.utils.log_utils import init_logger
 from lightllm.server.router.dynamic_prompt.shared_arr import SharedInt
@@ -8,7 +9,17 @@ logger = init_logger(__name__)
 
 
 class MemoryManager:
-    def __init__(self, size, dtype, head_num, head_dim, layer_num, always_copy=False):
+    def __init__(self, size: int, dtype: torch.dtype, head_num: int, head_dim: int, layer_num: int, always_copy=False):
+        """构建一个以 token 为单位的 MemoryManager
+
+        Args:
+            size: 预计要准备的 token 数量
+            dtype (torch.dtype): token 的 dtype
+            head_num (int): head 个数
+            head_dim (int): head 的 dim 维度
+            layer_num (int): layer 个数, 内部buffer 会对每个 layer 初始化一段 buffer
+            always_copy (bool, optional): 如果是 always copy, 则 alloc_contiguous 不允许执行, 看起来主要是量化时使用, 具体背后逻辑待学习. Defaults to False.
+        """
         self.size = size
         self.dtype = dtype
         self.head_num = head_num
@@ -34,7 +45,7 @@ class MemoryManager:
         self._init_buffers(size, dtype, head_num, head_dim, layer_num)
 
     def _init_buffers(self, size, dtype, head_num, head_dim, layer_num):
-        self.kv_buffer = [
+        self.kv_buffer = [  # 2 * head_num 是因为 k 和 v
             torch.empty((size, 2 * head_num, head_dim), dtype=dtype, device="cuda") for _ in range(layer_num)
         ]
 
@@ -43,6 +54,7 @@ class MemoryManager:
 
     @torch.no_grad()
     def alloc(self, need_size):
+        """返回的是一个1D-Tensor, 包含了一组被选中的 token index"""
         if need_size > self.can_use_mem_size:
             logger.warn(f"warn no enough cache need_size {need_size} left_size {self.can_use_mem_size}")
             return None
@@ -52,7 +64,15 @@ class MemoryManager:
         return select_index
 
     @torch.no_grad()
-    def alloc_contiguous(self, need_size):
+    def alloc_contiguous(self, need_size: int) -> Tuple[torch.Tensor, int, int]:
+        """申请一组连续的 token, 连续的 token 意味着在 kv cache 上实际分配也是连续的, 对计算更友好
+
+        Args:
+            need_size (int): 需要的 token 数量
+
+        Returns:
+            tuple[torch.Tensor, int, int]: 一个1d-tensor, 表示申请到的所有 index, 以及这些index在列表中的位置(其实就是index的min和max..)
+        """
         if self.always_copy:
             return None
         if need_size > self.can_use_mem_size:
@@ -61,8 +81,8 @@ class MemoryManager:
 
         can_use_index = torch.nonzero(self.mem_state == 0).view(-1)
         can_use_index_size = len(can_use_index)
-        can_use_index = can_use_index[0 : can_use_index_size - need_size + 1][
-            (can_use_index[need_size - 1 :] - can_use_index[0 : can_use_index_size - need_size + 1]) == need_size - 1
+        can_use_index = can_use_index[0: can_use_index_size - need_size + 1][
+            (can_use_index[need_size - 1:] - can_use_index[0: can_use_index_size - need_size + 1]) == need_size - 1
         ]
         if can_use_index.shape[0] == 0:
             # logger.warn(f'warn no enough cache need_size {need_size} left_size {self.can_use_mem_size}')

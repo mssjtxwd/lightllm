@@ -168,27 +168,37 @@ class InferReqGroup:
             else:
                 self.min_score = min(score, self.min_score)
 
-    def beam_copy(self, req_manager, is_prefill):
+    def beam_copy(self, req_manager: ReqManager, is_prefill):
+        """主要功能: 将 group 的 req 集合内容, 替换成 self.prev_beamid 对应的 req 的内容. """
         cache_req = {}
         cache_req_to_token = {}
         # record previous status
+        # req_group 记录的是一堆 req id, 在 beam_search 情况下, req_id 对应的 Req 的内容是会发生改变的
+        # prev_beamid 里记录的是这一轮新的 best_of req, 在目前的 beamid, 可能有重复
+        # 我们需要把这些 req cache下来, 这样后面就可以替换了
         for i, prev_ in enumerate(self.prev_beamid):
-            prev_req = requests_mapping[self.req_group[prev_]]
+            prev_req = requests_mapping[self.req_group[prev_]]  # 得到排名第 i 的答案来自哪个 req
+            # 记录一下 prev_ 这个 req 的 tokens
             if prev_ not in cache_req_to_token:
                 cache_req[prev_] = copy.deepcopy(prev_req)
                 prev_tokens = req_manager.req_to_token_indexs[prev_req.req_idx][: len(prev_req.input_token_ids)].clone()
                 cache_req_to_token[prev_] = prev_tokens
+
+            # for i in range(len(self.req_group)):
             req = self.get_req(i)
-            if not is_prefill or i == 0:
+            if not is_prefill or i == 0:  # 要刷新一轮 req, 所以对应 req_group 里所有的 req 的 token 都可以移除一个引用
                 req_manager.mem_manager.free(req_manager.req_to_token_indexs[req.req_idx][: len(req.input_token_ids)])
 
+        # cache_req 记录的是, 上一轮的 beamid 对应的 req,
+        # 做一个大规模的替换, 把 req 替换到新迭代出来的 bestof 个答案中
+        # 替换方法是
         # update the InferReq status and mem_manager status for cache sharing
         for i, req_id in enumerate(self.req_group):
-            prev_ = self.prev_beamid[i]
-            prev_req = cache_req[prev_]
-            req = requests_mapping[req_id]
-            req.input_token_ids = copy.deepcopy(prev_req.input_token_ids)
-            req.out_token_id_count = copy.deepcopy(req.out_token_id_count)
+            prev_ = self.prev_beamid[i]  # 获得第 i 个答案在之前的 beam id
+            prev_req = cache_req[prev_]  # cache_req 的 key 就是它, 于是获取第 i 个答案之前的 req 的 cache备份
+            req: InferReq = requests_mapping[req_id]  # 获得当前 req id 对应的 req
+            req.input_token_ids = copy.deepcopy(prev_req.input_token_ids)  # 替换当前 req 的内容
+            req.out_token_id_count = copy.deepcopy(req.out_token_id_count)  # 这个可以不替换? 按道理都是一样的?
             req.logprobs = copy.deepcopy(req.logprobs)
             req.finish_status = FinishStatus.NO_FINISH
             req_manager.req_to_token_indexs[req.req_idx][: len(req.input_token_ids)] = cache_req_to_token[prev_]
@@ -270,7 +280,7 @@ class InferBatch:
             if r_obj.req_status in [ReqRunStatus.RERUNNING_FROM_OFFLOAD, ReqRunStatus.WAIT_IN_QUEUE]:
                 if radix_cache is not None:
                     key = torch.tensor(r_obj.input_token_ids, dtype=torch.int64, device="cpu")
-                    key = key[0 : len(key) - 1]  # 最后一个不需要，因为需要一个额外的token，让其在prefill的时候输出下一个token的值
+                    key = key[0: len(key) - 1]  # 最后一个不需要，因为需要一个额外的token，让其在prefill的时候输出下一个token的值
                     share_node, kv_len, value_tensor = radix_cache.match_prefix(key, update_refs=True)
                     if share_node is not None:
                         r_obj.shared_kv_node = share_node
@@ -295,7 +305,7 @@ class InferBatch:
         if self.radix_cache is None:
             free_token_index.append(self.req_manager.req_to_token_indexs[req.req_idx][: req.cur_kv_len])
         else:
-            key = torch.tensor(req.input_token_ids[0 : req.cur_kv_len], dtype=torch.int64, device="cpu")
+            key = torch.tensor(req.input_token_ids[0: req.cur_kv_len], dtype=torch.int64, device="cpu")
             value = self.req_manager.req_to_token_indexs[req.req_idx][: req.cur_kv_len].detach().cpu()
             prefix_len = self.radix_cache.insert(key, value)
             free_token_index.append(self.req_manager.req_to_token_indexs[req.req_idx][:prefix_len])

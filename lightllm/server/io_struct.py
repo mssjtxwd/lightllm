@@ -5,6 +5,8 @@ from .sampling_params import SamplingParams
 from .multimodal_params import MultimodalParams
 from typing import Dict, List, Optional, Tuple, Union
 from lightllm.server.req_id_generator import convert_sub_id_to_group_id
+from lightllm.utils.log_utils import init_logger
+logger = init_logger(__name__)
 
 
 class ReqRunStatus(enum.Enum):
@@ -91,7 +93,12 @@ class NormalReq(Req):
     def get_tuple_tokens(self, is_busy, router_max_new_token_len):
         """
         普通continues batch调度模式, 先prefill 后 decode 的估计方式 的实现
+
+        这里返回的是估计值, 所以可以不那么准确, 毕竟这个接口只是供 req_queue 判断能否新增加一个 req 用的, 你可以设的更紧, 导致没新增成功并不会有特别大影响
         """
+        logger.info(
+            "[NormalReq get_tuple_tokens] 普通continues batch调度模式, 先prefill 后 decode 的估计方式 的实现,"
+            "返回已确定生成的token总数(包括输入token + 当前已生成的token) 以及估计的, 最大还能输出的token数量")
         has_out_len = self.cur_output_len
         if self.sample_params.ignore_eos:
             cur_max_new_token_len = self.max_output_len
@@ -101,12 +108,16 @@ class NormalReq(Req):
             # 用当前输出长度的 1.1 倍作为预估输出长度的另一个参考量，用于更新估计的最大输出长度量
             # 后续会更新为更合理的统计条件概率估计方式 to do
             cur_max_new_token_len = min(self.max_output_len, max(int(1.1 * has_out_len), router_max_new_token_len))
+        logger.info('self.input_len = %s, has_out_len = %s, cur_max_new_token_len = %s', self.input_len, has_out_len, cur_max_new_token_len)
 
+        # 事实上, 一个 req 最多会占用的 token 数 = self.input_len + cur_max_new_token_len - 1, 因为最后一个 token 并不会占用 kvcache
+        # 所以要保证两边加起来 = self.input_len + cur_max_new_token_len - 1
         if self.req_status == ReqRunStatus.RUNNING:
             return (self.input_len + has_out_len, max(0, cur_max_new_token_len - has_out_len - 1))
         elif self.req_status == ReqRunStatus.WAIT_IN_QUEUE:
-            return (self.input_len + 1, max(0, cur_max_new_token_len - 1 - 1))
+            return (self.input_len + 1, max(0, cur_max_new_token_len - 1))
         elif self.req_status == ReqRunStatus.PAUSED_AND_OFFLOAD:
+            # PAUSED 状态下, 已确定生成的 token 数 = input_len + has_out_len(已输出的数量) + 1
             return (self.input_len + has_out_len + 1, max(0, cur_max_new_token_len - has_out_len - 1 - 1))
         else:
             assert False, "error state"
@@ -254,6 +265,11 @@ class Batch:
         return batch_input_tokens
 
     def mark_and_get_finished_req_and_preupdate_status(self):
+        """此接口完成如下几个功能
+        1. 扫描 batch 内的 req, 记录其中 unfinished 的 req 以及 finished 的 req
+        2. 更新 batch 内 batch_decode_need_tokens 这个参数(即 batch 内 req 所需 decode 的 token 的总数), 因为 finish 的 req 不再需要 decode,
+           所以在列举 finish/unfinish 的同时更新了该状态(有点 dirty)
+        """
         unfinished_req_ids, finished_req_ids = [], []
         for req in self.reqs:
             if req.finish_status.is_finished():
@@ -266,6 +282,7 @@ class Batch:
         return unfinished_req_ids, finished_req_ids
 
     def filter_out_finished_req(self, unfinished_req_ids, finished_req_ids):
+        """利用 unfinished_req_id 和 finished_req_ids 去除 batch 内维护的 finish 的 req"""
         # update batch
         if len(finished_req_ids) != 0:
             self.reqs = [self.id_to_reqs[req_id] for req_id in unfinished_req_ids]

@@ -1,3 +1,10 @@
+from lightllm.utils.log_utils import init_logger
+from ..metrics import monitor
+from ..sampling_params import SamplingParams
+from ..req_id_generator import convert_sub_id_to_group_id
+from ..embed_cache.utils import get_shm_name_data, create_shm
+from ..io_struct import BatchStrOut, AbortReq, FinishStatus
+from ..tokenizer import get_tokenizer
 import sys
 import zmq
 import zmq.asyncio
@@ -8,13 +15,6 @@ import time
 import hashlib
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-from ..tokenizer import get_tokenizer
-from ..io_struct import BatchStrOut, AbortReq, FinishStatus
-from ..embed_cache.utils import get_shm_name_data, create_shm
-from ..req_id_generator import convert_sub_id_to_group_id
-from ..sampling_params import SamplingParams
-from ..metrics import monitor
-from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -103,21 +103,26 @@ class HttpServerManager:
             await self._alloc_multimodal_resources(multimodal_params)
             prompt_ids = self.tokenizer.encode(prompt, multimodal_params)
         else:
+            logger.info("[httpserver.manager] http线程负责 tokenizer, 这里是 tokenizer 的部分")
             prompt_ids = self.tokenizer.encode(prompt)
         prompt_tokens = len(prompt_ids)
         monitor.histogram_observe("lightllm_request_input_length", prompt_tokens)
         monitor.histogram_observe("lightllm_request_max_new_tokens", sampling_params.max_new_tokens)
         if prompt_tokens > self.max_req_input_len:
             # use long_truncation_mode to truncate long input len req.
+            logger.info("[httpserver.manager] 超过了设置的 req 的最大输入大小")
             if self.args.long_truncation_mode is None:
+                logger.info("[httpserver.manager] 不允许截断, 则报错")
                 raise ValueError(f"the input prompt token len {prompt_tokens} is too long > {self.max_req_input_len}")
             elif self.args.long_truncation_mode == "head":
-                prompt_ids = prompt_ids[-self.max_req_input_len :]
+                logger.info("[httpserver.manager] 允许截断, 那走截断, 策略是 head")
+                prompt_ids = prompt_ids[-self.max_req_input_len:]
                 prompt_tokens = len(prompt_ids)
             elif self.args.long_truncation_mode == "center":
+                logger.info("[httpserver.manager] 允许截断, 那走截断, 策略是 center")
                 prompt_ids = (
-                    prompt_ids[0 : self.max_req_input_len // 2]
-                    + prompt_ids[-(self.max_req_input_len - self.max_req_input_len // 2) :]
+                    prompt_ids[0: self.max_req_input_len // 2]
+                    + prompt_ids[-(self.max_req_input_len - self.max_req_input_len // 2):]
                 )
                 prompt_tokens = len(prompt_ids)
                 assert prompt_tokens == self.max_req_input_len
@@ -132,6 +137,7 @@ class HttpServerManager:
         if req_total_len + 1 > self.total_token_num:
             raise ValueError(f"the req token total len + 1 is too long > max_total_token_num:{self.total_token_num}")
 
+        logger.info("[httpserver.manager] 根据 sampling params, 将 stop sentences 转换成 token ids[Q: stop sentences 如何产生作用]")
         sampling_params.stop_sentences_to_token_ids(self.tokenizer)
 
         req_status = ReqStatus(group_request_id, multimodal_params)
@@ -141,17 +147,20 @@ class HttpServerManager:
         if self.enable_multimodal:
             self.send_to_visual.send_pyobj((prompt_ids, sampling_params, multimodal_params, group_request_id))
         else:
+            logger.info("[httpserver.manager] 发送 prompt 到 router, prompt_ids len = %s, prompt_ids = %s", len(prompt_ids), prompt_ids)
             self.send_to_router.send_pyobj((prompt_ids, sampling_params, multimodal_params, group_request_id))
 
         unfinished_count = sampling_params.best_of
 
         while True:
             try:
+                logger.info("[httpserver.manager] 默默等待 detokenization 把结果发回来")
                 await asyncio.wait_for(event.wait(), timeout=5)
             except asyncio.TimeoutError:
                 pass
 
             if request is not None and await request.is_disconnected():
+                logger.info("[httpserver.manager] abort 原请求")
                 await self.abort(group_request_id)
                 raise Exception(f"req_id {group_request_id} disconnected")
 
@@ -166,6 +175,12 @@ class HttpServerManager:
                     first_token_cost_ms = (time.time() - start_time) * 1000 if is_first_token else first_token_cost_ms
                     is_first_token = False
 
+                    logger.info(
+                        "[httpserver.manager] 吐出一些 token: out_str = %s, metadata = %s, finish_status = %s",
+                        out_str,
+                        metadata,
+                        finish_status)
+
                     yield sub_req_id, out_str, metadata, finish_status
 
                     # 如果有子请求完成，就更新计数
@@ -174,10 +189,11 @@ class HttpServerManager:
 
                     # 所有子请求完成后，就删除占用的资源
                     if unfinished_count == 0:
+                        logger.info("httpserver.manager] 所有子请求完成后，就删除占用的资源")
                         try:
                             del self.req_id_to_out_inf[group_request_id]
                             await self._release_multimodal_resources(multimodal_params)
-                        except:
+                        except BaseException:
                             pass
                         total_cost_time_ms = (time.time() - start_time) * 1000
                         mean_per_token_cost_time_ms = (total_cost_time_ms - first_token_cost_ms) / out_token_counter
@@ -206,7 +222,7 @@ class HttpServerManager:
             req = self.req_id_to_out_inf[group_request_id]
             await self._release_multimodal_resources(req.multimodal_params)
             del self.req_id_to_out_inf[group_request_id]
-        except:
+        except BaseException:
             pass
         logger.warning(f"aborted group_request_id {group_request_id}")
         return
@@ -226,7 +242,7 @@ class HttpServerManager:
                             req_status.event.set()
                     else:
                         del self.req_id_to_out_inf[group_req_id]
-                except:
+                except BaseException:
                     pass
         return
 

@@ -1,10 +1,13 @@
 import re
 import torch
 from typing import List, Tuple
-from lightllm.server.router.model_infer.infer_batch import InferBatch, group_mapping, requests_mapping
+from lightllm.server.router.model_infer.infer_batch import InferBatch, group_mapping, requests_mapping, InferReqGroup, InferReq
 from lightllm.common.basemodel.triton_kernel.apply_penalty import apply_penalty
 from lightllm.server.io_struct import FinishStatus
 from lightllm.server.router.model_infer.mode_backend.continues_batch.post_process import _top_p_top_k
+from lightllm.utils.log_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def sample(logits, req_groups, is_prefill, vocab_size, req_manager, eos_id: List[int] = [2]):
@@ -48,7 +51,7 @@ def sample(logits, req_groups, is_prefill, vocab_size, req_manager, eos_id: List
     batch_cumlogprob = []
     start = 0
     for i in range(len(req_groups)):
-        req_group = req_groups[i]
+        req_group: InferReqGroup = req_groups[i]
         best_of = req_group.best_of
         end = start + 1 if is_prefill else start + best_of
         if best_of > 1:
@@ -76,29 +79,31 @@ def random_sample(probs_sort, probs_idx):
     return batch_next_token_ids, batch_next_token_probs
 
 
-def beam_sample(probs, req_group, is_prefill, eos_id, vocab_size, req_manager):
+def beam_sample(probs, req_group: InferReqGroup, is_prefill, eos_id, vocab_size, req_manager):
     best_of = req_group.best_of
     next_token_id = []
     next_token_logprob = []
     next_cumlogprob = []
     valid_beams = 0
-    logprobs = torch.log(probs)
+    logprobs = torch.log(probs)  # shape = (req_len, vocab_size)
     if not is_prefill:
         logprobs += torch.tensor(req_group.get_cumlogprobs(), device=probs.device, dtype=probs.dtype).unsqueeze(1)
     # probs = probs.view(-1)
     best_of = req_group.best_of
+    # logprobs 打平, 获取的是整体的 topk
     next_logprobs, next_inds = torch.topk(logprobs.view(-1), 2 * best_of, dim=0, largest=True, sorted=True)
     next_logprobs = next_logprobs.detach().cpu().numpy()
+    # 通过 // vocab_size 得到采样的topk 对应的 beam id(即 req 在 req_group 里的 index)
     beam_id = (next_inds // vocab_size).detach().cpu().numpy()
     next_tokens = (next_inds % vocab_size).detach().cpu().numpy()
     best_score = -float("inf")
     for i in range(2 * best_of):
-        req_obj = requests_mapping[req_group.req_group[beam_id[i]]]
+        req_obj: InferReq = requests_mapping[req_group.req_group[beam_id[i]]]
         req_obj.input_token_ids.append(next_tokens[i])
         req_obj.logprobs.append(next_logprobs[i])
         req_obj.update_finish_status(eos_id)
         if req_obj.finish_status.is_finished():
-            output_ids = req_obj.input_token_ids[req_obj.prompt_len :]
+            output_ids = req_obj.input_token_ids[req_obj.prompt_len:]
             req_group.add_res(output_ids, req_obj.logprobs, next_logprobs[i], req_obj.finish_status.value)
             if not req_obj.finish_status == FinishStatus.FINISHED_LENGTH:
                 req_obj.finish_status = FinishStatus.NO_FINISH
@@ -115,6 +120,7 @@ def beam_sample(probs, req_group, is_prefill, eos_id, vocab_size, req_manager):
         if valid_beams == best_of:
             break
     # req_manager.beam_copy(req_group, is_prefill)
+    logger.debug("[beam_sample], req_group.prev_beamid = %s", req_group.prev_beamid)
     req_group.beam_copy(req_manager, is_prefill)
     req_group.update_finish_status(best_score)
     return next_token_id, next_token_logprob, next_cumlogprob

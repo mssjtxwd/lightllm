@@ -5,6 +5,8 @@ from typing import List
 from lightllm.utils.infer_utils import calculate_time
 from lightllm.server.io_struct import Batch, Req
 from lightllm.server.io_struct import ReqRunStatus, FinishStatus
+from lightllm.utils.log_utils import init_logger
+logger = init_logger(__name__)
 
 
 class BaseQueue:
@@ -40,11 +42,24 @@ class BaseQueue:
         return
 
     def is_busy(self):
+        # logger.info("BaseQueue, 判断服务是否繁忙")
         # 计算当前所有的token使用量, 如果使用了dynamic prompt cache, 使用的token量中不包含，cache tree 中未被引用的数据。
         cur_all_used_tokens = self.router.get_used_tokens()
+        # logger.info(
+        #     "cur_all_used_tokens = %s(计算当前所有的token使用量, 如果使用了dynamic prompt cache, "
+        #     "使用的token量中不包含 cache tree 中未被引用的数据。) ",
+        #     cur_all_used_tokens)
         # 判断当前服务是否处于token使用率过高的状态，过高的情况下，调度要偏向保守
         cur_token_ratio = cur_all_used_tokens / self.max_total_tokens
         is_busy = cur_token_ratio >= self.router_token_ratio
+        # logger.info(
+        #     "cur_token_ratio = %s[=cur_all_used_tokens[%s] / self.max_total_tokens[%s]],"
+        #     " if > self.router_token_ratio[%s] then busy, so is_busy = %s",
+        #     cur_token_ratio,
+        #     cur_all_used_tokens,
+        #     self.max_total_tokens,
+        #     self.router_token_ratio,
+        #     is_busy)
         return is_busy
 
     def generate_new_batch(self, current_batch: Batch):

@@ -7,7 +7,7 @@ from lightllm.server.io_struct import ReqRunStatus
 
 
 class Strategy:
-    def ordering_reqs(self, batch: Batch):
+    def ordering_reqs(self, batch: Batch) -> List:
         raise not NotImplemented()
 
 

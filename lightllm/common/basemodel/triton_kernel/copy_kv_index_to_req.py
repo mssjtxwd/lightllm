@@ -19,7 +19,15 @@ def _fwd_kernel_copy_kv_index_to_req(
 
 
 @torch.no_grad()
-def copy_kv_index_to_req(req_to_token_indexs, b_req_idx, b_seq_len, memindex):
+def copy_kv_index_to_req(req_to_token_indexs: torch.Tensor, b_req_idx: torch.Tensor, b_seq_len: torch.Tensor, memindex: torch.Tensor):
+    """把申请下来的 kv memory index 补充到 req_to_token_indexs 里, req_to_token_indexs 维护了每个 req 占据的 memory token index
+
+    Args:
+        req_to_token_indexs (torch.Tensor): 待更新的 req_to_token_indexs Tensor
+        b_req_idx (torch.Tensor): 一个 1d-tensor, 表示每个 req 的 index
+        b_seq_len (torch.Tensor): 一个 1d-tensor, 表示每个 req *应该有的* seq len(即可以认为, 已包含了这次 decode 的 token)
+        memindex (torch.Tensor): 一个 1d-tensor, 表示申请下来的 memory token index
+    """
     seq_len = b_seq_len.shape[0]
     assert b_seq_len.shape[0] == memindex.shape[0] and b_req_idx.shape[0] == b_seq_len.shape[0]
     grid = (seq_len,)

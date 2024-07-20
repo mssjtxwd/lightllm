@@ -8,6 +8,10 @@ from lightllm.utils.log_utils import init_logger
 from .pre_process import prepare_prefill_inputs, prepare_decode_inputs
 from .post_process import sample
 
+from lightllm.utils.log_utils import init_logger
+
+logger = init_logger(__name__)
+
 
 class ContinuesBatchBackend(ModeBackend):
     def __init__(self) -> None:

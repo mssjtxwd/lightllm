@@ -126,7 +126,7 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         )
         rotary_emb_fwd(
             q.view(-1, self.tp_q_head_num_, self.head_dim_),
-            cache_kv[:, 0 : self.tp_k_head_num_, :],
+            cache_kv[:, 0: self.tp_k_head_num_, :],
             infer_state.position_cos,
             infer_state.position_sin,
         )
@@ -140,8 +140,8 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             kv = infer_state.mem_manager.kv_buffer[self.layer_num_]
             context_attention_fwd(
                 q.view(-1, self.tp_q_head_num_, self.head_dim_),
-                kv[:, 0 : self.tp_k_head_num_, :],
-                kv[:, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :],
+                kv[:, 0: self.tp_k_head_num_, :],
+                kv[:, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :],
                 o_tensor.view(-1, self.tp_q_head_num_, self.head_dim_),
                 infer_state.b_req_idx,
                 infer_state.b_start_loc,
@@ -153,9 +153,9 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         else:
             context_attention_fwd_no_prompt_cache(
                 q.view(-1, self.tp_q_head_num_, self.head_dim_),
-                kv[:, 0 : self.tp_k_head_num_, :],
-                kv[:, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :],
-                o_tensor.view(-1, self.tp_q_head_num_, self.head_dim_),
+                kv[:, 0: self.tp_k_head_num_, :],  # kv 中提取的 k
+                kv[:, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :],  # kv 中提取的 v
+                o_tensor.view(-1, self.tp_q_head_num_, self.head_dim_),  # o_tensor
                 infer_state.b_start_loc,
                 infer_state.b_seq_len,
                 infer_state.max_len_in_batch,
@@ -170,10 +170,10 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         infer_state.start_event.record(torch.cuda.default_stream())
         if infer_state.decode_req_num > 0:
             self._token_attention_kernel(
-                q[0 : infer_state.decode_req_num, :],
+                q[0: infer_state.decode_req_num, :],
                 infer_state.inner_decode_infer_status,
                 layer_weight,
-                out=o_tensor[0 : infer_state.decode_req_num, :],
+                out=o_tensor[0: infer_state.decode_req_num, :],
             )
         calcu_shape1 = (-1, self.tp_q_head_num_, self.head_dim_)
         if infer_state.prefill_req_num > 0:
@@ -182,12 +182,12 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             with torch.cuda.stream(infer_state.parrall_stream):
                 # assert torch.cuda.current_stream().cuda_stream == infer_state.parrall_stream.cuda_stream
                 splitfuse_context_attention_fwd(
-                    q[infer_state.decode_req_num :, :].view(calcu_shape1),
-                    infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
+                    q[infer_state.decode_req_num:, :].view(calcu_shape1),
+                    infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
                     infer_state.mem_manager.kv_buffer[self.layer_num_][
-                        :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                        :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
                     ],
-                    o_tensor[infer_state.decode_req_num :, :].view(calcu_shape1),
+                    o_tensor[infer_state.decode_req_num:, :].view(calcu_shape1),
                     infer_state.prefill_req_num,
                     infer_state.req_manager.req_to_token_indexs,
                     infer_state.prefill_b_req_idx,
@@ -210,26 +210,26 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         infer_state.start_event.record(torch.cuda.default_stream())
         if infer_state.decode_req_num > 0:
             self._token_attention_kernel(
-                q[0 : infer_state.decode_req_num, :],
+                q[0: infer_state.decode_req_num, :],
                 infer_state.inner_decode_infer_status,
                 layer_weight,
-                out=o_tensor[0 : infer_state.decode_req_num, :],
+                out=o_tensor[0: infer_state.decode_req_num, :],
             )
         calcu_shape1 = (-1, self.tp_q_head_num_, self.head_dim_)
         if infer_state.prefill_req_num > 0:
             infer_state.parrall_stream.wait_event(infer_state.start_event)
             with torch.cuda.stream(infer_state.parrall_stream):
                 splitfuse_context_attention_fwd_int8kv(
-                    q[infer_state.decode_req_num :, :].view(calcu_shape1),
-                    infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
-                    infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
+                    q[infer_state.decode_req_num:, :].view(calcu_shape1),
+                    infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
+                    infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
                     infer_state.mem_manager.kv_buffer[self.layer_num_][
-                        :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                        :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
                     ],
                     infer_state.mem_manager.scale_buffer[self.layer_num_][
-                        :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                        :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
                     ],
-                    o_tensor[infer_state.decode_req_num :, :].view(calcu_shape1),
+                    o_tensor[infer_state.decode_req_num:, :].view(calcu_shape1),
                     infer_state.prefill_req_num,
                     infer_state.req_manager.req_to_token_indexs,
                     infer_state.prefill_b_req_idx,
@@ -304,7 +304,7 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
 
         token_att_fwd(
             q.view(calcu_shape1),
-            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
+            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
             att_m_tensor,
             infer_state.req_manager.req_to_token_indexs,
             infer_state.b_req_idx,
@@ -321,7 +321,7 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         token_softmax_reducev_fwd(
             att_m_tensor,
             infer_state.mem_manager.kv_buffer[self.layer_num_][
-                :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
             ],
             o_tensor.view(calcu_shape1),
             infer_state.req_manager.req_to_token_indexs,
@@ -341,9 +341,9 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         o_tensor = torch.empty_like(q) if out is None else out
         gqa_decode_attention_fwd(
             q.view(calcu_shape1),
-            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
+            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
             infer_state.mem_manager.kv_buffer[self.layer_num_][
-                :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
             ],
             o_tensor.view(calcu_shape1),
             infer_state.req_manager.req_to_token_indexs,
@@ -359,8 +359,8 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         att_m_tensor = torch.empty((self.tp_q_head_num_, total_token_num), dtype=q.dtype, device="cuda")
         token_att_fwd_int8k(
             q.view(calcu_shape1),
-            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
-            infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
+            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
+            infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
             att_m_tensor,
             infer_state.req_manager.req_to_token_indexs,
             infer_state.b_req_idx,
@@ -379,10 +379,10 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         token_att_fwd2_int8v(
             prob,
             infer_state.mem_manager.kv_buffer[self.layer_num_][
-                :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
             ],
             infer_state.mem_manager.scale_buffer[self.layer_num_][
-                :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
             ],
             o_tensor.view(calcu_shape1),
             infer_state.req_manager.req_to_token_indexs,
@@ -397,9 +397,9 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     def _token_decode_attention_flashdecoding(self, q, infer_state: LlamaInferStateInfo, layer_weight, out=None):
         from lightllm.models.llama.triton_kernel.flash_decoding import token_decode_attention_flash_decoding
 
-        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :]
+        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :]
         cache_v = infer_state.mem_manager.kv_buffer[self.layer_num_][
-            :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+            :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
         ]
         return token_decode_attention_flash_decoding(
             q, infer_state, self.tp_q_head_num_, self.head_dim_, cache_k, cache_v, out=out
@@ -409,9 +409,9 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         # 对 gqa 模型进行推理优化的代码
         from ..triton_kernel.gqa_flash_decoding import gqa_token_decode_attention_flash_decoding
 
-        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :]
+        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :]
         cache_v = infer_state.mem_manager.kv_buffer[self.layer_num_][
-            :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+            :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
         ]
         return gqa_token_decode_attention_flash_decoding(
             q, infer_state, self.tp_q_head_num_, self.head_dim_, cache_k, cache_v, out=out
@@ -429,13 +429,13 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         group8_int8kv_decode_attention(
             o_tensor.view(calcu_shape1),
             q.view(calcu_shape1),
-            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
-            infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
+            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
+            infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
             infer_state.mem_manager.kv_buffer[self.layer_num_][
-                :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
             ],
             infer_state.mem_manager.scale_buffer[self.layer_num_][
-                :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
             ],
             infer_state.req_manager.req_to_token_indexs,
             infer_state.b_req_idx,
@@ -457,9 +457,9 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             o_tensor.view(calcu_shape1),
             1.0 / (self.head_dim_ ** 0.5),
             q.view(calcu_shape1),
-            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :],
+            infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :],
             infer_state.mem_manager.kv_buffer[self.layer_num_][
-                :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+                :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
             ],
             infer_state.req_manager.req_to_token_indexs,
             infer_state.b_req_idx,
@@ -474,9 +474,9 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     ):
         from lightllm.models.llama.triton_kernel.ppl_fp16_flash_decoding import token_decode_attention_flash_decoding
 
-        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :]
+        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :]
         cache_v = infer_state.mem_manager.kv_buffer[self.layer_num_][
-            :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+            :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
         ]
         return token_decode_attention_flash_decoding(
             q, infer_state, self.tp_q_head_num_, self.head_dim_, cache_k, cache_v, out=out
@@ -487,13 +487,13 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     ):
         from lightllm.models.llama.triton_kernel.ppl_int8kv_flash_decoding import token_decode_attention_flash_decoding
 
-        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :]
-        cache_k_scale = infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :]
+        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :]
+        cache_k_scale = infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :]
         cache_v = infer_state.mem_manager.kv_buffer[self.layer_num_][
-            :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+            :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
         ]
         cache_v_scale = infer_state.mem_manager.scale_buffer[self.layer_num_][
-            :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+            :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
         ]
         return token_decode_attention_flash_decoding(
             q, infer_state, self.tp_q_head_num_, self.head_dim_, cache_k, cache_k_scale, cache_v, cache_v_scale, out=out
@@ -504,13 +504,13 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     ):
         from lightllm.models.llama.triton_kernel.ppl_int4kv_flash_decoding import token_decode_attention_flash_decoding
 
-        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :]
-        cache_k_scale = infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0 : self.tp_k_head_num_, :]
+        cache_k = infer_state.mem_manager.kv_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :]
+        cache_k_scale = infer_state.mem_manager.scale_buffer[self.layer_num_][:, 0: self.tp_k_head_num_, :]
         cache_v = infer_state.mem_manager.kv_buffer[self.layer_num_][
-            :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+            :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
         ]
         cache_v_scale = infer_state.mem_manager.scale_buffer[self.layer_num_][
-            :, self.tp_k_head_num_ : self.tp_k_head_num_ + self.tp_v_head_num_, :
+            :, self.tp_k_head_num_: self.tp_k_head_num_ + self.tp_v_head_num_, :
         ]
         return token_decode_attention_flash_decoding(
             q, infer_state, self.tp_q_head_num_, self.head_dim_, cache_k, cache_k_scale, cache_v, cache_v_scale, out=out

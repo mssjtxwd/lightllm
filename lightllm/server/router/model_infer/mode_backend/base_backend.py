@@ -72,6 +72,7 @@ class ModeBackend:
         self.weight_dir = kvargs["weight_dir"]
         max_total_token_num = kvargs["max_total_token_num"]
 
+        # 初始化当前进程
         dist.init_process_group(
             "nccl", init_method=f'tcp://127.0.0.1:{kvargs["nccl_port"]}', rank=self.tp_rank, world_size=world_size
         )
@@ -230,6 +231,7 @@ class ModeBackend:
             self.model.vocab_size,
             self.radix_cache,
         )
+        self.logger.debug("[ModelBackend][add batch], batch_id = %s, reqs = %s, batch_data = %s", batch_id, reqs, batch_data)
         self.cache[batch_id] = batch_data
 
         # 将更新后的状态返回给调用方用于router中请求的状态

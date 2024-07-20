@@ -20,6 +20,7 @@ class LlamaPreLayerInfer(PreLayerInferTpl):
 
     @mark_cost_time("pre context forward")
     def context_forward(self, input_ids, infer_state: LlamaInferStateInfo, layer_weight: LlamaPreAndPostLayerWeight):
+        """标准的, tp 处理 embedding 部分的方法: embedding 自己包含的 vocab 部分, 其他部分置0, 然后整体做一下 all_reduce"""
         input_mask = torch.logical_or(self.vob_start_id_ > input_ids, input_ids >= self.vob_end_id_)
         tmp_input_ids = input_ids - self.vob_start_id_
         tmp_input_ids[input_mask] = 0

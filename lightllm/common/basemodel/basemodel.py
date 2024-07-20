@@ -15,6 +15,10 @@ from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.triton_kernel.splitfuse_copy_kv_index_to_req import splitfuse_copy_kv_index_to_req
 
+from lightllm.utils.log_utils import init_logger
+
+logger = init_logger(__name__)
+
 torch.backends.cudnn.enabled = True
 
 
@@ -206,6 +210,8 @@ class TpPartBaseModel:
         b_ready_cache_len,
         multimodal_params,
     ):
+        logger.debug("[_prefill], b_seq_len = %s, input_ids(shape) = %s", b_seq_len, input_ids.shape)
+        # 初始化 infer_state
         infer_state = self.infer_state_class()
         infer_state.is_prefill = True
         infer_state.is_token_healing = self.is_token_healing
@@ -218,6 +224,7 @@ class TpPartBaseModel:
         infer_state.b_req_idx = b_req_idx
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
+        # b_ready_cache_len 如果没传进来, 则在 prefill 阶段默认 = 0
         if b_ready_cache_len is not None:
             infer_state.b_ready_cache_len = b_ready_cache_len
         else:
@@ -227,7 +234,8 @@ class TpPartBaseModel:
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager
 
-        alloc_mem = self.mem_manager.alloc_contiguous(input_ids.shape[0])
+        # alloc_mem 包含了申请到的 token indexs, 以及在 mem 中的 start 位置和 end 位置
+        alloc_mem = self.mem_manager.alloc_contiguous(input_ids.shape[0])  # input_ids 是 batch 打平后的结果, 因此只有1维
         if alloc_mem is not None:
             infer_state.mem_is_contiguous = True
             infer_state.mem_index = alloc_mem[0]
@@ -238,12 +246,15 @@ class TpPartBaseModel:
             infer_state.mem_is_contiguous = False
             alloc_mem = self.mem_manager.alloc(input_ids.shape[0])
             infer_state.mem_index = alloc_mem
+            # context_forward 写的必须是一块连续 mem, 如果没申请到连续 mem, 则会先给这次 infer 申请一块 kv_buffer, 传上来
+            # 之后, 再把这组 kv_buffer 内容写回到整体的 mem 当中
             infer_state.kv_buffer = torch.empty(
                 (input_ids.shape[0], self.tp_k_head_num_ + self.tp_v_head_num_, self.head_dim_),
                 dtype=self.data_type,
                 device="cuda",
             )
-
+        # 初始化 req_to_token_indexs 这个 2D-array, 其第一维是 req_idx, 第二维是这个 req 目前在 memory manager 里
+        # 占据的 token index
         init_req_to_token_indexes(
             self.req_manager.req_to_token_indexs,
             b_req_idx,
@@ -252,7 +263,7 @@ class TpPartBaseModel:
             max_len_in_batch,
             infer_state.mem_index,
         )
-
+        # 目前啥操作都没, 留着的接口
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._context_forward(input_ids, infer_state)
         return predict_logics
@@ -268,6 +279,7 @@ class TpPartBaseModel:
         b_seq_len,
         multimodal_params,
     ):
+        logger.debug("[_decode], b_seq_len = %s, input_ids(shape) = %s", b_seq_len, input_ids.shape)
         infer_state = self.infer_state_class()
         infer_state.is_prefill = False
         infer_state.batch_size = batch_size
@@ -388,10 +400,13 @@ class TpPartBaseModel:
 
     @final
     def _context_forward(self, input_ids, infer_state: InferStateInfo):
+        logger.info("[_context_forward], input_ids size = %s", input_ids.size())
         cuda_input_ids = input_ids
         input_embs = self.pre_infer.context_forward(cuda_input_ids, infer_state, self.pre_post_weight)
+        logger.info("[_context_forward], after pre_infer, input_embs size = %s", input_embs.size())
         for i in range(self.layers_num):
             input_embs = self.layers_infer[i].context_forward(input_embs, infer_state, self.trans_layers_weight[i])
+        logger.info("[_context_forward], after layer_infers, input_embs size = %s", input_embs.size())
         predict_logics = self.post_infer.token_forward(input_embs, infer_state, self.pre_post_weight)
         return predict_logics
 

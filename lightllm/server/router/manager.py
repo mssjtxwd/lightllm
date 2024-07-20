@@ -1,3 +1,23 @@
+from lightllm.server.metrics import monitor
+from lightllm.server.req_id_generator import convert_sub_id_to_group_id
+from lightllm.server.router.token_load import TokenLoad
+from lightllm.utils.log_utils import init_logger
+from ..tokenizer import get_tokenizer
+from .pause_strategy import Fcfs, select_paused_reqs
+from .stats import Stats
+from ..io_struct import BatchTokenIdOut, AbortReq, ReqRunStatus, FinishStatus, ReqDetokenizationState
+from .dynamic_prompt.radix_cache import RadixCacheReadOnlyClient
+from .dynamic_prompt.shared_arr import SharedInt
+from lightllm.utils.infer_utils import calculate_time
+from rpyc.utils.classic import obtain
+from .req_queue import build_req_queue
+from .model_infer.model_rpc import start_model_process, ModelRpcClient
+from ..multimodal_params import MultimodalParams
+from ..io_struct import Req, NormalReq, SplitFuseReq, Batch
+from ..sampling_params import SamplingParams
+from typing import Dict, List, Optional
+import zmq.asyncio
+import zmq
 import copy
 import time
 import uuid
@@ -5,26 +25,6 @@ import uvloop
 import asyncio
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-import zmq
-import zmq.asyncio
-from typing import Dict, List, Optional
-from ..sampling_params import SamplingParams
-from ..io_struct import Req, NormalReq, SplitFuseReq, Batch
-from ..multimodal_params import MultimodalParams
-from .model_infer.model_rpc import start_model_process, ModelRpcClient
-from .req_queue import build_req_queue
-from rpyc.utils.classic import obtain
-from lightllm.utils.infer_utils import calculate_time
-from .dynamic_prompt.shared_arr import SharedInt
-from .dynamic_prompt.radix_cache import RadixCacheReadOnlyClient
-from ..io_struct import BatchTokenIdOut, AbortReq, ReqRunStatus, FinishStatus, ReqDetokenizationState
-from .stats import Stats
-from .pause_strategy import Fcfs, select_paused_reqs
-from ..tokenizer import get_tokenizer
-from lightllm.utils.log_utils import init_logger
-from lightllm.server.router.token_load import TokenLoad
-from lightllm.server.req_id_generator import convert_sub_id_to_group_id
-from lightllm.server.metrics import monitor
 
 monitor.init_router_monitor()
 logger = init_logger(__name__)
@@ -100,6 +100,7 @@ class RouterManager:
                 "beam_mode": self.args.beam_mode,
                 "diverse_mode": self.args.diverse_mode,
             }
+            logger.info("init model rank %s, kvargs = %s", rank_id, kvargs)
             init_model_ret.append(self.model_rpcs[rank_id].init_model(kvargs))
 
         await asyncio.gather(*init_model_ret)
@@ -115,9 +116,11 @@ class RouterManager:
         multimodal_params: MultimodalParams,
         group_req_id: int,
     ):
+        logger.info("[router managar] addreq 开始执行")
         req_group = []
         for i in range(sampling_params.best_of):
             if self.is_splitfuse_mode:
+                logger.info("[router managar][add_req] best_of <%s> 以 splitfuse 模式开始执行, 因此请求被打成 SplitFuseReq", i)
                 req = SplitFuseReq(
                     group_req_id + i,
                     copy.deepcopy(prompt_ids),
@@ -126,9 +129,10 @@ class RouterManager:
                     self.splitfuse_block_size,
                 )
             else:
+                logger.info("[router managar][add_req] best_of <%s> 以非 SplitFuse 模式开始执行, 因此请求被打成 NormalReq", i)
                 req = NormalReq(group_req_id + i, copy.deepcopy(prompt_ids), sampling_params, multimodal_params)
             req_group.append(req)
-
+        logger.info("[router manager][add_req] req_group is append to req_queue")
         self.req_queue.extend(req_group)
         self.send_to_detokenization.send_pyobj(
             ReqDetokenizationState(
@@ -194,13 +198,17 @@ class RouterManager:
         """
         事件处理循环
         """
+        # logger.info("_step ################################################################")
         # 删除所有已经 finished 的 req
         # 当前无运行请求时
         if self.running_batch is None:
+            # logger.info("[_step] 当前无运行请求时, generate new batch")
             new_batch = self.req_queue.generate_new_batch(self.running_batch)
             if new_batch is not None:
+                logger.info("[_step] 有newbatch产生, 更新 stat_pool(因为新增了一些 prompt tokens)")
                 self.stats_tool.count_prompt_tokens(new_batch)
                 self.running_batch = new_batch
+                logger.info("[_step] 有newbatch产生, 执行 _prefill_batch")
                 await self._prefill_batch(self.running_batch)
                 self._filter_runing_batch()
                 self.has_wait_tokens = 0
@@ -220,15 +228,16 @@ class RouterManager:
 
         # 正常 decode 阶段， 如果可以直接decode就直接decode，否则通过暂停策略暂停一些请求
         # 释放一些管理的 token
+        # 确认 batch 内一次 decode 需要额外占用的 token 数 + 当前已使用的 token 数是否会超标
         if self._can_decode(self.running_batch):
-            self.stats_tool.count_output_tokens(self.running_batch)
-            await self._decode_batch(self.running_batch)
-            self._filter_runing_batch()
-            self.has_wait_tokens += 1
+            self.stats_tool.count_output_tokens(self.running_batch)  # 如果不会超标, 则把 batch 这次会新增的 out token 刷新到 stats pool
+            await self._decode_batch(self.running_batch)  # 执行 decode_batch
+            self._filter_runing_batch()  # 从 running_batch 中过滤掉 finish 的 req
+            self.has_wait_tokens += 1  # 计数 + 1, 计数到阈值才会做 prefill
             return
-        else:
+        else:  # 无法直接 decode, 需要 pause 一些历史请求, 抢占对应的 token
             # pause strategy
-            paused_reqs = select_paused_reqs(
+            paused_reqs = select_paused_reqs(  # 选取需要暂停的 req, 注意这个函数内顺便已经帮你把 req 标记成暂停状态了, (感觉不是很合理..
                 self.running_batch, self.pause_strategy, self.req_queue, self.max_total_token_num
             )
             await self._pause_reqs(self.running_batch, paused_reqs)
@@ -238,37 +247,45 @@ class RouterManager:
         return
 
     async def _init_batch(self, batch: Batch):
+        logger.debug("[_init_batch] begin, 初始化 batch 状态, 做的事情如下")
+        logger.debug("[_init_batch] 初始化 batch 状态, 构建 batch 内 reqs 的 rpc obj, 用来给 model 推理的 rpc 进程发送")
         reqs = [r.to_rpc_obj() for r in batch.reqs]
+        # logger.debug("[_init_batch], 准备开始观察 init_batch 的内部逻辑,TODO##################################")
         rets = [self.model_rpcs[tp_rank].init_batch(batch.batch_id, reqs) for tp_rank in range(self.world_size)]
         ans = await asyncio.gather(*rets)
         if self.world_size != 1:
             req_to_req_status = obtain(ans[0])
         else:
             req_to_req_status = ans[0]
-
+        # 请求状态， 当前占用的kv的长度， 当前输出token的数量， 输出的token的id和元信息列表， 是否推理结束的状态， 额外保留参数
         self._update_init_status_to_batch(batch, req_to_req_status)
         logger.debug(f"Init Batch: {batch.simple_log()} \n")
         return
 
     async def _prefill_batch(self, batch: Batch):
+        logger.debug("[_prefill_batch], begin")
         await self._init_batch(batch)
         if not self.is_splitfuse_mode:
             # 在 非 splitfuse 模式下，才需要真的执行 prefill 的操作。
             rets = [self.model_rpcs[tp_rank].prefill_batch(batch.batch_id) for tp_rank in range(self.world_size)]
             ans = await asyncio.gather(*rets)
+            # 此处任取一个对象结果即可, 毕竟 model 是 tp 的, 即结果都是 all_reduce 后再发出来的
             if self.world_size != 1:
                 req_to_out_status = obtain(ans[0])
             else:
                 req_to_out_status = ans[0]
-
+            # 利用返上来的 res_to_out_status 更新 router 进程内的 req 的状态
             self._update_out_status_to_batch(batch, req_to_out_status)
+            # 获得 unfinished_req_id 以及 finished_req_ids 两个 list
             unfinished_req_ids, finished_req_ids = batch.mark_and_get_finished_req_and_preupdate_status()
+            #
             self._send_to_detokenization_proc(batch, req_to_out_status)
             batch.filter_out_finished_req(unfinished_req_ids, finished_req_ids)
             await self._handle_finish_req(batch, unfinished_req_ids, finished_req_ids)
         return
 
     async def _decode_batch(self, batch: Batch):
+        logger.debug("[_decode_batch], begin")
         rets = [self.model_rpcs[tp_rank].decode_batch(batch.batch_id) for tp_rank in range(self.world_size)]
         ans = await asyncio.gather(*rets)
         if self.world_size != 1:
@@ -279,7 +296,10 @@ class RouterManager:
         self._update_out_status_to_batch(batch, req_to_out_status)
         unfinished_req_ids, finished_req_ids = batch.mark_and_get_finished_req_and_preupdate_status()
         self._send_to_detokenization_proc(batch, req_to_out_status)
+        # 当前进程在发送结果后，还需要调用 batch.filter_out_finished_req 将batch 内 finish 的 req 去除，
+        # 这些 req 不应该参与后续的 decode 动作（前面提到的, 处于 abort 状态的 pause req，也会在恢复并完成 prefill 后，在此刻结束）
         batch.filter_out_finished_req(unfinished_req_ids, finished_req_ids)
+        # 利用 unfinished req ids 和 finished req ids 更新 batch 状态
         await self._handle_finish_req(batch, unfinished_req_ids, finished_req_ids)
         return
 
@@ -312,6 +332,7 @@ class RouterManager:
         return
 
     async def _handle_finish_req(self, batch: Batch, unfinished_req_ids, finished_req_ids):
+        """向底层 model_rpc 进程同步 router 主进程更新后的 batch 状态, 保持上下 batch 的状态同步"""
         if len(finished_req_ids) != 0:
             if batch.is_clear():
                 await self._remove_batch(batch)
@@ -329,6 +350,7 @@ class RouterManager:
         return
 
     def _update_out_status_to_batch(self, batch: Batch, req_to_out_status):
+        """利用返上来的 res_to_out_status 更新 batch 内 req 的状态"""
         new_batch_decode_need_tokens = 0  # 只有在 splitfuse 模式下有意义
         for req_id, (
             req_status,
@@ -338,6 +360,9 @@ class RouterManager:
             finish_status_value,
             extral_info,
         ) in req_to_out_status.items():
+            logger.debug("req_id = %s, req_to_req_status = %s(请求状态), %s(当前占用的kv的长度), %s(当前输出token的数量)"
+                         ", %s(输出的token的id和元信息列表), %s(是否推理结束的状态)"
+                         ", %s(额外保留参数)", req_id, req_status, cur_kv_len, cur_output_len, token_info_list, finish_status_value, extral_info)
             req: Req = batch.id_to_reqs[req_id]
             req.req_status = req_status
             req.cur_kv_len = cur_kv_len
@@ -358,6 +383,8 @@ class RouterManager:
         return batch.batch_decode_need_tokens + self.get_used_tokens() <= self.max_total_token_num
 
     def _send_to_detokenization_proc(self, batch: Batch, req_ans):
+        """将 req_ans 结果推送到 detokenization 进程, 完成剩余工作;
+        batch 传进来是因为 req_ans 内部只包含了 req_id, 需要从 batch 内捞取 req 的 finish status"""
         batch_out = BatchTokenIdOut()
         for req_id, (_, _, _, token_info_list, _, _) in req_ans.items():
             req = batch.id_to_reqs[req_id]
@@ -386,6 +413,8 @@ class RouterManager:
             recv_req = await self.recv_from_httpserver.recv_pyobj()
             if isinstance(recv_req, tuple) and len(recv_req) == 4:
                 prompt_ids, sampling_params, multimodal_params, group_req_id = recv_req
+                logger.info("[router manager] 收到一个 http 请求, 准备开始执行, "
+                            "请求[prompt_ids, sampling_params, multimodal_params, group_req_id]为 %s", recv_req)
                 self.add_req(prompt_ids, sampling_params, multimodal_params, group_req_id)
             elif isinstance(recv_req, AbortReq):
                 abort_req = recv_req
@@ -416,7 +445,7 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
         )
 
         asyncio.run(router.wait_to_model_ready())
-    except:
+    except BaseException:
         import traceback
         import sys
 
